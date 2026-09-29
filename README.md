@@ -40,6 +40,11 @@ GraphLinkTypes will display "related" on the link in the graph view.
 ## Development and Contributions
 Interested in contributing to the development of Graph Link Types? Check out the [Obsidian Sample Plugin](https://github.com/obsidianmd/obsidian-sample-plugin) for guidelines on how to develop a custom plugin for Obsidian.
 
+### Testing this performance build
+
+Run `npm ci` and `npm run build`. Copy `main.js`, `manifest.json`, and `styles.css` into `.obsidian/plugins/graph-link-types/` in a test vault, then reload Obsidian. Keep a backup of the installed plugin before replacing it. The built `main.js` is ignored by Git, as in the upstream repository.
+
+This build scans graph links in short batches, caches Dataview metadata by source note, and updates positions only for links that have labels. Graph topology is checked every 500 ms; metadata changes are debounced. The intended result is lower startup and idle CPU usage, especially in large vaults. Obsidian graph rendering uses internal APIs, so verify labels and optional colors against your own vault after installing.
+
 ## Milestone Goals
 Stay updated with our progress and future plans by checking our [Milestone Goals](https://github.com/natefrisch01/Graph-Link-Types/milestones).
-

@@ -1,4 +1,4 @@
-import { Plugin, Notice , App, PluginSettingTab, Setting} from 'obsidian';
+import { Plugin, App, PluginSettingTab, Setting} from 'obsidian';
 import { getAPI } from 'obsidian-dataview';
 import { ObsidianRenderer, ObsidianLink} from 'src/types';
 import { LinkManager } from 'src/linkManager';
@@ -70,6 +70,12 @@ export default class GraphLinkTypesPlugin extends Plugin {
     api: ReturnType<typeof getAPI> = null;
     currentRenderer: ObsidianRenderer | null = null;
     animationFrameId: number | null = null;
+    private syncIntervalId: number | null = null;
+    private metadataTimerId: number | null = null;
+    private rendererRetryId: number | null = null;
+    private rendererRetryCount = 0;
+    private syncTimeoutId: number | null = null;
+    private syncInProgress = false;
     linkManager = new LinkManager();
     indexReady = false;
 
@@ -78,6 +84,7 @@ export default class GraphLinkTypesPlugin extends Plugin {
 
         await this.loadSettings();
         this.addSettingTab(new GraphLinkTypesSettingTab(this.app, this));
+        this.app.workspace.onLayoutReady(() => this.handleLayoutChange());
 
         // Try to get Dataview API — may not be ready yet if Dataview
         // loads after this plugin (class field initializers run before
@@ -90,17 +97,14 @@ export default class GraphLinkTypesPlugin extends Plugin {
                 this.api = getAPI();
                 this.linkManager.api = this.api;
                 this.initEventHandlers();
-                // Only start rendering if a graph view is already open.
-                // Otherwise layout-change handler picks it up when one opens.
-                if (this.currentRenderer) {
-                    this.startUpdateLoop();
-                }
+                this.handleLayoutChange();
             }));
             return;
         }
 
         this.linkManager.api = this.api;
         this.initEventHandlers();
+        this.handleLayoutChange();
     }
 
     private initEventHandlers(): void {
@@ -112,14 +116,22 @@ export default class GraphLinkTypesPlugin extends Plugin {
         // @ts-ignore
         this.registerEvent(this.app.metadataCache.on("dataview:index-ready", () => {
             this.indexReady = true;
+            this.scheduleMetadataRefresh();
         }));
 
         // @ts-ignore
         this.registerEvent(this.app.metadataCache.on("dataview:metadata-change", () => {
-            if (this.indexReady) {
-                this.handleLayoutChange();
-            }
+            if (this.indexReady) this.scheduleMetadataRefresh();
         }));
+    }
+
+    private scheduleMetadataRefresh(): void {
+        if (this.metadataTimerId !== null) window.clearTimeout(this.metadataTimerId);
+        this.metadataTimerId = window.setTimeout(() => {
+            this.metadataTimerId = null;
+            this.linkManager.clearMetadataCache();
+            if (this.currentRenderer) this.startUpdateLoop();
+        }, 250);
     }
 
     async loadSettings() {
@@ -152,110 +164,119 @@ export default class GraphLinkTypesPlugin extends Plugin {
         return null;
     }
     
-    async handleLayoutChange() {
-        // Cancel the animation frame on layout change
-        if (this.animationFrameId !== null) {
-            cancelAnimationFrame(this.animationFrameId);
-            this.animationFrameId = null;
-        }
-        await this.waitForRenderer();
+    handleLayoutChange(): void {
+        if (!this.api) return;
+        this.rendererRetryCount = 0;
         this.checkAndUpdateRenderer();
     }
 
-    checkAndUpdateRenderer() {
+    checkAndUpdateRenderer(): void {
         const newRenderer = this.findRenderer();
+        if (newRenderer && newRenderer === this.currentRenderer) return;
+        this.stopUpdateLoop();
+        if (this.currentRenderer) this.linkManager.destroyMap(this.currentRenderer);
+        this.currentRenderer = newRenderer;
         if (!newRenderer) {
-            this.currentRenderer = null;
+            // Graph views sometimes create their renderer after layout-change.
+            if (this.rendererRetryId !== null) window.clearTimeout(this.rendererRetryId);
+            if (this.rendererRetryCount++ < 20 &&
+                (this.app.workspace.getLeavesOfType('graph').length || this.app.workspace.getLeavesOfType('localgraph').length)) {
+                this.rendererRetryId = window.setTimeout(() => {
+                    this.rendererRetryId = null;
+                    this.checkAndUpdateRenderer();
+                }, 500);
+            }
             return;
         }
+        if (this.rendererRetryId !== null) window.clearTimeout(this.rendererRetryId);
+        this.rendererRetryId = null;
         newRenderer.px.stage.sortableChildren = true;
-        this.currentRenderer = newRenderer;
         this.startUpdateLoop();
     }
 
-    
-    waitForRenderer(): Promise<void> {
-        return new Promise((resolve) => {
-            const checkInterval = 500;
-            const maxWait = 10000; // 10 seconds max — don't poll forever
-            let elapsed = 0;
-
-            const intervalId = setInterval(() => {
-                const renderer = this.findRenderer();
-                elapsed += checkInterval;
-                if (renderer || elapsed >= maxWait) {
-                    clearInterval(intervalId);
-                    resolve();
-                }
-            }, checkInterval);
-        });
+    startUpdateLoop(): void {
+        if (!this.currentRenderer) return;
+        this.stopUpdateLoop();
+        this.linkManager.destroyMap(this.currentRenderer);
+        if (!this.settings.tagNames && !this.settings.tagColors) return;
+        this.syncTimeoutId = window.setTimeout(() => this.syncLinks(), 0);
+        this.syncIntervalId = window.setInterval(() => this.syncLinks(), 500);
     }
 
-    // Function to start the update loop for rendering.
-    startUpdateLoop(verbosity: number = 0): void {
-        if (!this.currentRenderer) {
-            if (verbosity > 0) {
-                new Notice('No valid graph renderer found.');
-            }
-            return;
-        }
-        const renderer : ObsidianRenderer = this.currentRenderer;
-        // Remove existing text from the graph.
-        this.linkManager.destroyMap(renderer);
-
-        // Call the function to update positions in the next animation frame.
-        requestAnimationFrame(this.updatePositions.bind(this));
+    private stopUpdateLoop(): void {
+        if (this.animationFrameId !== null) cancelAnimationFrame(this.animationFrameId);
+        if (this.syncIntervalId !== null) window.clearInterval(this.syncIntervalId);
+        if (this.syncTimeoutId !== null) window.clearTimeout(this.syncTimeoutId);
+        this.animationFrameId = null;
+        this.syncIntervalId = null;
+        this.syncTimeoutId = null;
+        this.syncInProgress = false;
     }
 
-
-    // Function to continuously update the positions of text objects.
-    updatePositions(): void {
-
-        // Find the graph renderer in the workspace.
-        if (!this.currentRenderer) {
-            return;
-        }
-
-        const renderer: ObsidianRenderer = this.currentRenderer;
-
-        let updateMap = false;
-
-        if (this.animationFrameId && this.animationFrameId % 10 == 0) {
-            updateMap = true;
-            // Update link manager with the current frame's links
-            this.linkManager.removeLinks(renderer, renderer.links);
-        }
-        
-        // For each link in the graph, update the position of its text.
-        // Guard against null source/target — can happen with broken wikilinks
-        renderer.links.forEach((link: ObsidianLink) => {
-            if (!link || !link.source || !link.target) return;
-            if (updateMap) {
+    private syncLinks(): void {
+        const renderer = this.currentRenderer;
+        if (!renderer || this.syncInProgress) return;
+        this.syncTimeoutId = null;
+        this.syncInProgress = true;
+        const links = renderer.links.slice();
+        const currentLinks: ObsidianLink[] = [];
+        let index = 0;
+        const processBatch = () => {
+            if (renderer !== this.currentRenderer || !this.syncInProgress) return;
+            const deadline = performance.now() + 6;
+            while (index < links.length && performance.now() < deadline) {
+                const link = links[index++];
+                if (!link?.source?.id || !link?.target?.id) continue;
+                currentLinks.push(link);
                 const key = this.linkManager.generateKey(link.source.id, link.target.id);
                 if (!this.linkManager.linksMap.has(key)) {
-                    this.linkManager.addLink(renderer, link, this.settings.tagColors, this.settings.tagLegend);
+                    this.linkManager.addLink(renderer, link, this.settings.tagNames, this.settings.tagColors, this.settings.tagLegend);
+                } else {
+                    this.linkManager.linksMap.get(key)!.obsidianLink = link;
                 }
             }
-            this.linkManager.updateLinkText(renderer, link, this.settings.tagNames);
-            if (this.settings.tagColors) {
-                this.linkManager.updateLinkGraphics(renderer, link);
+            if (index < links.length) {
+                this.syncTimeoutId = window.setTimeout(processBatch, 0);
+                return;
             }
-        });
+            this.syncTimeoutId = null;
+            this.syncInProgress = false;
+            this.linkManager.removeLinks(renderer, currentLinks);
+            if (this.linkManager.linksMap.size > 0 && this.animationFrameId === null) {
+                this.animationFrameId = requestAnimationFrame(() => this.updatePositions());
+            }
+        };
+        processBatch();
+    }
 
-        // Continue updating positions in the next animation frame.
-        this.animationFrameId = requestAnimationFrame(this.updatePositions.bind(this));
+    private updatePositions(): void {
+        const renderer = this.currentRenderer;
+        if (!renderer) return;
+        for (const gltLink of this.linkManager.linksMap.values()) {
+            this.linkManager.updateLinkText(renderer, gltLink.obsidianLink, this.settings.tagNames);
+            if (this.settings.tagColors) this.linkManager.updateLinkGraphics(renderer, gltLink.obsidianLink);
+        }
+        this.animationFrameId = this.linkManager.linksMap.size > 0
+            ? requestAnimationFrame(() => this.updatePositions()) : null;
+    }
+
+    onunload(): void {
+        this.stopUpdateLoop();
+        if (this.metadataTimerId !== null) window.clearTimeout(this.metadataTimerId);
+        if (this.rendererRetryId !== null) window.clearTimeout(this.rendererRetryId);
+        if (this.currentRenderer) this.linkManager.destroyMap(this.currentRenderer);
+        this.linkManager.dispose();
     }
 
     private isObsidianRenderer(renderer: any): renderer is ObsidianRenderer {
         return renderer 
             && renderer.px 
             && renderer.px.stage 
-            && renderer.panX
-            && renderer.panY
+            && typeof renderer.panX === 'number'
+            && typeof renderer.panY === 'number'
             && typeof renderer.px.stage.addChild === 'function' 
             && typeof renderer.px.stage.removeChild === 'function'
             && Array.isArray(renderer.links);
     }
 
 }
-

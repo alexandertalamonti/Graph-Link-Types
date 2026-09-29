@@ -55,9 +55,14 @@ export enum LinkPair {
 
 export interface GltLink {
     obsidianLink: ObsidianLink;
+    label: string;
     pairStatus: LinkPair;
     pixiText: Text | null;
     pixiGraphics: Graphics | null;
+    graphicsState?: {
+        sourceX: number; sourceY: number; targetX: number; targetY: number;
+        panX: number; panY: number; scale: number; nodeScale: number;
+    };
 }
 
 export interface GltLegendGraphic {

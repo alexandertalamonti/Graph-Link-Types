@@ -12,6 +12,9 @@ export class LinkManager {
     currentTheme : string;
     textColor : string;
     tagColors: Map<string, GltLegendGraphic>;
+    private metadataCache = new Map<string, Map<string, string>>();
+    private themeObserver: MutationObserver | null = null;
+    private themeTimer: number | null = null;
     categoricalColors: number[] = [
         0xF44336, // Red
         0x03A9F4, // Light Blue
@@ -48,26 +51,38 @@ export class LinkManager {
         this.linksMap = new Map<string, GltLink>();
         this.tagColors = new Map<string, GltLegendGraphic>();
 
-        // Detect changes to the theme.
+        this.currentTheme = document.body.classList.contains('theme-dark') ? 'theme-dark' : 'theme-light';
+        this.textColor = getComputedStyle(document.body).getPropertyValue('--text-normal').trim();
         this.detectThemeChange();
     }
 
+    clearMetadataCache(): void {
+        this.metadataCache.clear();
+    }
+
+    dispose(): void {
+        this.themeObserver?.disconnect();
+        if (this.themeTimer !== null) window.clearTimeout(this.themeTimer);
+    }
+
     generateKey(sourceId: string, targetId: string): string {
-        return `${sourceId}-${targetId}`;
+        return JSON.stringify([sourceId, targetId]);
     }
     
     private detectThemeChange(): void {
         let lastTheme = '';
         let lastStyleSheetHref = '';
-        let debounceTimer: number;
-    
-        const themeObserver = new MutationObserver(() => {
-            clearTimeout(debounceTimer);
-            debounceTimer = window.setTimeout(() => {
+        this.themeObserver = new MutationObserver(() => {
+            if (this.themeTimer !== null) window.clearTimeout(this.themeTimer);
+            this.themeTimer = window.setTimeout(() => {
                 this.currentTheme = document.body.classList.contains('theme-dark') ? 'theme-dark' : 'theme-light';
                 const currentStyleSheetHref = document.querySelector('link[rel="stylesheet"][href*="theme"]')?.getAttribute('href');
                 if ((this.currentTheme && this.currentTheme !== lastTheme) || (currentStyleSheetHref !== lastStyleSheetHref)) {
                     this.textColor = this.getComputedColorFromClass(this.currentTheme, '--text-normal');
+                    for (const link of this.linksMap.values()) {
+                        if (link.pixiText) link.pixiText.style.fill = this.textColor;
+                    }
+                    for (const legend of this.tagColors.values()) legend.legendText.style.fill = this.textColor;
                     lastTheme = this.currentTheme;
                     if (currentStyleSheetHref) {
                         lastStyleSheetHref = currentStyleSheetHref;
@@ -76,8 +91,8 @@ export class LinkManager {
             }, 100); // Debounce delay
         });
     
-        themeObserver.observe(document.body, { attributes: true, attributeFilter: ['class'] });
-        themeObserver.observe(document.head, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] });
+        this.themeObserver.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+        this.themeObserver.observe(document.head, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] });
     }
     
     private getComputedColorFromClass(className : string, cssVariable : string) : string {
@@ -106,15 +121,18 @@ export class LinkManager {
         }
     }
 
-    addLink(renderer: ObsidianRenderer, obLink: ObsidianLink, tagColors: boolean, tagLegend: boolean): void {
+    addLink(renderer: ObsidianRenderer, obLink: ObsidianLink, tagNames: boolean, tagColors: boolean, tagLegend: boolean): void {
+        const label = this.getMetadataKeyForLink(obLink.source.id, obLink.target.id);
+        if (label === null) return;
         const key = this.generateKey(obLink.source.id, obLink.target.id);
         const reverseKey = this.generateKey(obLink.target.id, obLink.source.id);
         const pairStatus = (obLink.source.id !== obLink.target.id) && this.linksMap.has(reverseKey) ? LinkPair.Second : LinkPair.None;
         const newLink: GltLink = {
             obsidianLink: obLink,
+            label,
             pairStatus: pairStatus,
-            pixiText: this.initializeLinkText(renderer, obLink, pairStatus),
-            pixiGraphics: tagColors ? this.initializeLinkGraphics(renderer, obLink, tagLegend) : null,
+            pixiText: tagNames ? this.initializeLinkText(renderer, obLink, pairStatus, label) : null,
+            pixiGraphics: tagColors ? this.initializeLinkGraphics(renderer, obLink, tagLegend, label) : null,
         };
 
         this.linksMap.set(key, newLink);
@@ -133,17 +151,17 @@ export class LinkManager {
 
         const gltLink = this.linksMap.get(key);
         
-        if (gltLink && gltLink.pixiText && renderer.px && renderer.px.stage && renderer.px.stage.children && renderer.px.stage.children.includes(gltLink.pixiText)) {
+        if (gltLink && gltLink.pixiText && gltLink.pixiText.parent) {
             renderer.px.stage.removeChild(gltLink.pixiText);
             gltLink.pixiText.destroy();
         }
 
-        if (gltLink && gltLink.pixiGraphics && renderer.px && renderer.px.stage && renderer.px.stage.children && renderer.px.stage.children.includes(gltLink.pixiGraphics)) {
+        if (gltLink && gltLink.pixiGraphics && gltLink.pixiGraphics.parent) {
             renderer.px.stage.removeChild(gltLink.pixiGraphics);
             gltLink.pixiGraphics.destroy();
         }
 
-        let colorKey = gltLink?.pixiText?.text?.replace(/\r?\n/g, "");
+        const colorKey = gltLink?.label;
         if (colorKey) {
             if (this.tagColors.has(colorKey)) {
                 const legendGraphic = this.tagColors.get(colorKey);
@@ -153,11 +171,11 @@ export class LinkManager {
                         this.yOffset -= this.lineHeight;
                         this.currentTagColorIndex -= 1;
                         if (this.currentTagColorIndex < 0) this.currentTagColorIndex = this.categoricalColors.length - 1;
-                        if (legendGraphic.legendText && renderer.px && renderer.px.stage && renderer.px.stage.children && renderer.px.stage.children.includes(legendGraphic.legendText)) {
+                        if (legendGraphic.legendText && legendGraphic.legendText.parent) {
                             renderer.px.stage.removeChild(legendGraphic.legendText);
                             legendGraphic.legendText.destroy();
                         }
-                        if (legendGraphic.legendGraphics && renderer.px && renderer.px.stage && renderer.px.stage.children && renderer.px.stage.children.includes(legendGraphic.legendGraphics)) {
+                        if (legendGraphic.legendGraphics && legendGraphic.legendGraphics.parent) {
                             renderer.px.stage.removeChild(legendGraphic.legendGraphics);
                             legendGraphic.legendGraphics.destroy();
                         }
@@ -213,20 +231,18 @@ export class LinkManager {
         const midY: number = (link.source.y + link.target.y) / 2;
         // Transform the mid-point coordinates based on the renderer's pan and scale
         const { x, y } = this.getLinkToTextCoordinates(midX, midY, renderer.panX, renderer.panY, renderer.scale);
-        if (text && renderer.px && renderer.px.stage && renderer.px.stage.children && renderer.px.stage.children.includes(text)) {
+        if (text && text.parent) {
             // Set the position and scale of the text
-            text.x = x;
-            text.y = y;
-            text.scale.set(1 / (3 * renderer.nodeScale));
-            text.style.fill = this.textColor;
+            if (text.x !== x) text.x = x;
+            if (text.y !== y) text.y = y;
+            const textScale = 1 / (3 * renderer.nodeScale);
+            if (text.scale.x !== textScale) text.scale.set(textScale);
             if (tagNames) {
-                if (!link.source || !link.target || !link.source.text || !link.target.text || !link.target.text.alpha || !link.source.text.alpha) {
-                    text.alpha = 0.9;
-                } else {
-                    text.alpha = Math.max(link.source.text.alpha, link.target.text.alpha);
-                }
+                const alpha = link.source.text?.alpha && link.target.text?.alpha
+                    ? Math.max(link.source.text.alpha, link.target.text.alpha) : 0.9;
+                if (text.alpha !== alpha) text.alpha = alpha;
             } else {
-                text.alpha = 0.0;
+                if (text.alpha !== 0) text.alpha = 0;
             }
         }
     }
@@ -239,6 +255,18 @@ export class LinkManager {
         }
         const linkKey = this.generateKey(link.source.id, link.target.id);
         const gltLink = this.linksMap.get(linkKey);
+        if (link.source.id === link.target.id || !gltLink?.pixiGraphics) return;
+        const previous = gltLink.graphicsState;
+        if (previous && previous.sourceX === link.source.x && previous.sourceY === link.source.y &&
+            previous.targetX === link.target.x && previous.targetY === link.target.y &&
+            previous.panX === renderer.panX && previous.panY === renderer.panY &&
+            previous.scale === renderer.scale && previous.nodeScale === renderer.nodeScale) return;
+        gltLink.graphicsState = {
+            sourceX: link.source.x, sourceY: link.source.y,
+            targetX: link.target.x, targetY: link.target.y,
+            panX: renderer.panX, panY: renderer.panY,
+            scale: renderer.scale, nodeScale: renderer.nodeScale,
+        };
         let graphics;
         if (gltLink) {
             graphics = gltLink.pixiGraphics;
@@ -263,7 +291,7 @@ export class LinkManager {
         y2 += ny - (link.target.weight/36+1) * py;
       
 
-        if (graphics && renderer.px && renderer.px.stage && renderer.px.stage.children && renderer.px.stage.children.includes(graphics)) {
+        if (graphics && graphics.parent) {
             // @ts-ignore
             const color = graphics._lineStyle.color;
             // Now, update the line whenever needed without creating a new graphics object each time
@@ -276,13 +304,10 @@ export class LinkManager {
     }
 
     // Create or update text for a given link
-    private initializeLinkText(renderer: ObsidianRenderer, link: ObsidianLink, pairStatus : LinkPair): Text | null{
+    private initializeLinkText(renderer: ObsidianRenderer, link: ObsidianLink, pairStatus : LinkPair, label: string): Text | null{
 
         // Get the text to display for the link
-        let linkString: string | null = this.getMetadataKeyForLink(link.source.id, link.target.id);
-        if (linkString === null) {
-            return null;
-        } //doesn't add if link is null
+        let linkString = label;
         if (link.source.id === link.target.id) {
             linkString = "";
         }
@@ -318,13 +343,10 @@ export class LinkManager {
     }
 
     // Create or update text for a given link
-    private initializeLinkGraphics(renderer: ObsidianRenderer, link: ObsidianLink, tagLegend: boolean): Graphics | null{
+    private initializeLinkGraphics(renderer: ObsidianRenderer, link: ObsidianLink, tagLegend: boolean, label: string): Graphics | null{
 
         // Get the text to display for the link
-        let linkString: string | null = this.getMetadataKeyForLink(link.source.id, link.target.id);
-        if (linkString === null) {
-            return null;
-        } //doesn't add if link is null
+        let linkString = label;
 
         let color;
         
@@ -363,7 +385,7 @@ export class LinkManager {
                     color: color,
                     legendText: textL,
                     legendGraphics: graphicsL,
-                    nUsing: 0,
+                    nUsing: 1,
                 };
 
                 this.tagColors.set(linkString, newLegendGraphic);
@@ -425,46 +447,25 @@ export class LinkManager {
 
     // Get the metadata key for a link between two pages
     private getMetadataKeyForLink(sourceId: string, targetId: string): string | null {
-        const sourcePage: any = this.api.page(sourceId);
-        if (!sourcePage) return null;
-
-        for (const [key, value] of Object.entries(sourcePage)) {
-			// Skip empty values 
-			if (value === null || value === undefined || value === '') {
-            	continue;
-        	}
-            const valueType = this.determineDataviewLinkType(value);
-
-            switch (valueType) {
-                case DataviewLinkType.WikiLink:
-                    // @ts-ignore
-                    if (value.path === targetId) {
-                        return key;
+        let labels = this.metadataCache.get(sourceId);
+        if (!labels) {
+            labels = new Map<string, string>();
+            const sourcePage: any = this.api?.page(sourceId);
+            if (sourcePage) {
+                for (const [key, value] of Object.entries(sourcePage)) {
+                    const values = Array.isArray(value) ? value : [value];
+                    for (const item of values) {
+                        const type = this.determineDataviewLinkType(item);
+                        let path: string | null = null;
+                        if (type === DataviewLinkType.WikiLink) path = item.path;
+                        if (type === DataviewLinkType.MarkdownLink) path = this.extractPathFromMarkdownLink(item);
+                        if (path && !labels.has(path)) labels.set(path, key);
                     }
-                    break;
-                case DataviewLinkType.MarkdownLink:
-                    if (this.extractPathFromMarkdownLink(value) === targetId) {
-                        return key;
-                    }
-                    break;
-                case DataviewLinkType.Array:
-                    // @ts-ignore
-                    for (const item of value) {
-                        if (this.determineDataviewLinkType(item) === DataviewLinkType.WikiLink && item.path === targetId) {
-                            return key;
-                        }
-                        if (this.determineDataviewLinkType(item) === DataviewLinkType.MarkdownLink && this.extractPathFromMarkdownLink(item) === targetId) {
-                            return key;
-                        }
-                    }
-                    break;
-                default:
-				    // We will continue to check other DataView properties
-				    break;
+                }
             }
+            this.metadataCache.set(sourceId, labels);
         }
-        // If no DataView properties match, we consider that metadata key does not exist
-        return null;
+        return labels.get(targetId) ?? null;
     }
 
     // Function to calculate the coordinates for placing the link text.
