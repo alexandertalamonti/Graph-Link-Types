@@ -44,7 +44,7 @@ Interested in contributing to the development of Graph Link Types? Check out the
 
 Run `npm ci` and `npm run build`. Copy `main.js`, `manifest.json`, and `styles.css` into `.obsidian/plugins/graph-link-types/` in a test vault, then reload Obsidian. Keep a backup of the installed plugin before replacing it. The built `main.js` is ignored by Git, as in the upstream repository.
 
-This build scans graph links in short batches, caches Dataview metadata by source note, and updates positions only for links that have labels. Graph topology is checked every 500 ms; metadata changes are debounced. The intended result is lower startup and idle CPU usage, especially in large vaults. Obsidian graph rendering uses internal APIs, so verify labels and optional colors against your own vault after installing.
+This build scans graph links in short batches, caches Dataview metadata by source note, and updates positions only for links that have labels. Graph topology is refreshed after workspace, note, and graph-control events; metadata changes are debounced. There is no recurring topology scan. Renderer readiness is retried briefly only while a Graph view is opening. The intended result is lower startup and idle CPU usage, especially in large vaults. Obsidian graph rendering uses internal APIs, so verify labels and optional colors against your own vault after installing. If an internal graph change leaves labels stale, use the **Refresh graph link labels** command in Obsidian's command palette.
 
 ## Milestone Goals
 Stay updated with our progress and future plans by checking our [Milestone Goals](https://github.com/natefrisch01/Graph-Link-Types/milestones).

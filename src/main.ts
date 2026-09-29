@@ -70,12 +70,13 @@ export default class GraphLinkTypesPlugin extends Plugin {
     api: ReturnType<typeof getAPI> = null;
     currentRenderer: ObsidianRenderer | null = null;
     animationFrameId: number | null = null;
-    private syncIntervalId: number | null = null;
     private metadataTimerId: number | null = null;
     private rendererRetryId: number | null = null;
     private rendererRetryCount = 0;
     private syncTimeoutId: number | null = null;
     private syncInProgress = false;
+    private syncQueued = false;
+    private graphViewListeners = new Map<HTMLElement, EventListener>();
     linkManager = new LinkManager();
     indexReady = false;
 
@@ -84,6 +85,15 @@ export default class GraphLinkTypesPlugin extends Plugin {
 
         await this.loadSettings();
         this.addSettingTab(new GraphLinkTypesSettingTab(this.app, this));
+        this.addCommand({
+            id: 'refresh-graph-link-labels',
+            name: 'Refresh graph link labels',
+            callback: () => {
+                this.linkManager.clearMetadataCache();
+                if (this.currentRenderer) this.startUpdateLoop();
+                else this.handleLayoutChange();
+            },
+        });
         this.app.workspace.onLayoutReady(() => this.handleLayoutChange());
 
         // Try to get Dataview API — may not be ready yet if Dataview
@@ -112,6 +122,9 @@ export default class GraphLinkTypesPlugin extends Plugin {
         this.registerEvent(this.app.workspace.on('layout-change', () => {
             this.handleLayoutChange();
         }));
+        this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.handleLayoutChange()));
+        this.registerEvent(this.app.workspace.on('file-open', () => this.handleLayoutChange()));
+        this.registerEvent(this.app.metadataCache.on('resolved', () => this.scheduleSync(200)));
 
         // @ts-ignore
         this.registerEvent(this.app.metadataCache.on("dataview:index-ready", () => {
@@ -166,13 +179,36 @@ export default class GraphLinkTypesPlugin extends Plugin {
     
     handleLayoutChange(): void {
         if (!this.api) return;
+        this.refreshGraphViewListeners();
         this.rendererRetryCount = 0;
         this.checkAndUpdateRenderer();
     }
 
+    private refreshGraphViewListeners(): void {
+        const leaves = [
+            ...this.app.workspace.getLeavesOfType('graph'),
+            ...this.app.workspace.getLeavesOfType('localgraph'),
+        ];
+        const currentElements = new Set(leaves.map(leaf => leaf.view.containerEl));
+        for (const [element, listener] of this.graphViewListeners) {
+            if (currentElements.has(element)) continue;
+            for (const type of ['input', 'change', 'click']) element.removeEventListener(type, listener);
+            this.graphViewListeners.delete(element);
+        }
+        for (const element of currentElements) {
+            if (this.graphViewListeners.has(element)) continue;
+            const listener: EventListener = () => this.scheduleSync(200);
+            for (const type of ['input', 'change', 'click']) element.addEventListener(type, listener);
+            this.graphViewListeners.set(element, listener);
+        }
+    }
+
     checkAndUpdateRenderer(): void {
         const newRenderer = this.findRenderer();
-        if (newRenderer && newRenderer === this.currentRenderer) return;
+        if (newRenderer && newRenderer === this.currentRenderer) {
+            this.scheduleSync(200);
+            return;
+        }
         this.stopUpdateLoop();
         if (this.currentRenderer) this.linkManager.destroyMap(this.currentRenderer);
         this.currentRenderer = newRenderer;
@@ -199,18 +235,26 @@ export default class GraphLinkTypesPlugin extends Plugin {
         this.stopUpdateLoop();
         this.linkManager.destroyMap(this.currentRenderer);
         if (!this.settings.tagNames && !this.settings.tagColors) return;
-        this.syncTimeoutId = window.setTimeout(() => this.syncLinks(), 0);
-        this.syncIntervalId = window.setInterval(() => this.syncLinks(), 500);
+        this.scheduleSync(0);
+    }
+
+    private scheduleSync(delay: number): void {
+        if (!this.currentRenderer || (!this.settings.tagNames && !this.settings.tagColors)) return;
+        if (this.syncInProgress) {
+            this.syncQueued = true;
+            return;
+        }
+        if (this.syncTimeoutId !== null) window.clearTimeout(this.syncTimeoutId);
+        this.syncTimeoutId = window.setTimeout(() => this.syncLinks(), delay);
     }
 
     private stopUpdateLoop(): void {
         if (this.animationFrameId !== null) cancelAnimationFrame(this.animationFrameId);
-        if (this.syncIntervalId !== null) window.clearInterval(this.syncIntervalId);
         if (this.syncTimeoutId !== null) window.clearTimeout(this.syncTimeoutId);
         this.animationFrameId = null;
-        this.syncIntervalId = null;
         this.syncTimeoutId = null;
         this.syncInProgress = false;
+        this.syncQueued = false;
     }
 
     private syncLinks(): void {
@@ -245,6 +289,10 @@ export default class GraphLinkTypesPlugin extends Plugin {
             if (this.linkManager.linksMap.size > 0 && this.animationFrameId === null) {
                 this.animationFrameId = requestAnimationFrame(() => this.updatePositions());
             }
+            if (this.syncQueued) {
+                this.syncQueued = false;
+                this.scheduleSync(0);
+            }
         };
         processBatch();
     }
@@ -265,6 +313,10 @@ export default class GraphLinkTypesPlugin extends Plugin {
         if (this.metadataTimerId !== null) window.clearTimeout(this.metadataTimerId);
         if (this.rendererRetryId !== null) window.clearTimeout(this.rendererRetryId);
         if (this.currentRenderer) this.linkManager.destroyMap(this.currentRenderer);
+        for (const [element, listener] of this.graphViewListeners) {
+            for (const type of ['input', 'change', 'click']) element.removeEventListener(type, listener);
+        }
+        this.graphViewListeners.clear();
         this.linkManager.dispose();
     }
 
